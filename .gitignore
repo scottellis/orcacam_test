@@ -1,0 +1,12 @@
+*.suo
+*.user
+*.aps
+*.o
+*.html
+Debug/*
+Release/*
+*.opensdf
+*.sdf
+orcacam_test/Debug/*
+orcacam_test/Release/*
+ipch/*
