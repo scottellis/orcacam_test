@@ -1,0 +1,4 @@
+A small program for testing the Hamamatsu Orca-Flash camera
+connected to an Xcelera PCIe frame grabber card.
+
+OpenCV is used for image processing and GUI elements.
