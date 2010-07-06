@@ -4,6 +4,7 @@
 */
 
 #include <windows.h>
+#include "resource.h"
 
 // DCAM-API
 #include "dcamapi.h"
@@ -18,11 +19,28 @@ void print_last_dcamerr(HDCAM hdcam, const char *lastcall);
 HDCAM allocate_camera();
 IplImage *allocate_image(HDCAM hdcam);
 bool set_exposure_time(HDCAM hdcam, double exposure_sec);
+bool get_exposure_time_from_user(HDCAM hdcam);
+bool setup_camera(HDCAM hdcam);
 bool read_one_frame(HDCAM hdcam, IplImage *img);
-void scale_image_to_16_bits(IplImage *img, int actual_bits);
+void scale_image_to_16_bits(IplImage *img);
+
+class genericInput {
+public:
+	char _title[32];
+	char _prompt[32];
+	double _old_value;
+	double _new_value;
+};
+
+BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam);
+
+int g_data_shift = 0;
+double g_exposure_sec = 0.0006;
 
 int main(int argc, char **argv)
 {
+	int key;
+	bool done;
 	HDCAM hdcam = 0;
 	IplImage *img = NULL;
 
@@ -30,24 +48,46 @@ int main(int argc, char **argv)
 
 	if (!hdcam)
 		goto done;
-				
+
+	if (!set_exposure_time(hdcam, g_exposure_sec))
+		goto done;
+
+	if (!setup_camera(hdcam))
+		goto done;
+
 	img = allocate_image(hdcam);
 	
 	if (!img)
 		goto done;
 
-	if (!set_exposure_time(hdcam, 0.0020))
-		goto done;
-
 	cvNamedWindow("HCImage", 0); //CV_WINDOW_AUTOSIZE);
 
-	do {
+	done = false;
+
+	while (!done) {
 		if (!read_one_frame(hdcam, img))
 			break;
 
 		cvShowImage("HCImage", img);
 		
-	} while (cvWaitKey(10) < 0);
+		key = cvWaitKey(10);
+
+		switch (key & 0xff) {
+		case 0x1b:	// escape
+			done = true;
+			break;
+
+		case 'G':
+		case 'g':
+			MessageBox((HWND)cvGetWindowHandle("HCImage"), "todo", "Gain Setting", MB_OK);
+			break;
+
+		case 'S':
+		case 's':
+			get_exposure_time_from_user(hdcam);
+			break;
+		}
+	}
 
 
 done:
@@ -98,6 +138,8 @@ IplImage *allocate_image(HDCAM hdcam)
 {
 	SIZE size;
 	CvSize sz;
+	unsigned long bytes_per_frame, pixel_depth;
+	
 	IplImage *img = NULL;
 
 	if (!dcam_getdatasize(hdcam, &size)) {
@@ -108,10 +150,25 @@ IplImage *allocate_image(HDCAM hdcam)
 	if (size.cx == 0 || size.cy == 0)
 		return NULL;
 
+	if (!dcam_getdataframebytes(hdcam, &bytes_per_frame)) {
+		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
+		return false;
+	}
+
 	sz.width = size.cx;
 	sz.height = size.cy;
 
-	img = cvCreateImage(sz, IPL_DEPTH_16U, 1);
+	pixel_depth = bytes_per_frame / (sz.width * sz.height);
+
+	if (pixel_depth == 2) {
+		img = cvCreateImage(sz, IPL_DEPTH_16U, 1);
+	}
+	else if (pixel_depth == 1) {
+		img = cvCreateImage(sz, IPL_DEPTH_8U, 1);
+	}
+	else {
+		printf("Unhandled pixel_depth %ld\n", pixel_depth);
+	}
 	
 	return img;
 }
@@ -121,6 +178,86 @@ bool set_exposure_time(HDCAM hdcam, double exposure_sec)
 	if (!dcam_setexposuretime(hdcam, exposure_sec)) {
 		print_last_dcamerr(hdcam, "dcam_setexposuretime");
 		return false;
+	}
+
+	g_exposure_sec = exposure_sec;
+
+	return true;
+}
+
+bool get_exposure_time_from_user(HDCAM hdcam)
+{
+	genericInput gi;
+
+	strncpy_s(gi._title, sizeof(gi._title), "Shutter Input", _TRUNCATE);
+	strncpy_s(gi._prompt, sizeof(gi._prompt), "Shutter (sec)", _TRUNCATE);
+	gi._old_value = g_exposure_sec;
+	gi._new_value = g_exposure_sec;
+
+	if (DialogBoxParam(GetModuleHandle(NULL), 
+						MAKEINTRESOURCE(IDD_DLG_GENERIC_INPUT),
+						(HWND) cvGetWindowHandle("HCImage"),
+						generic_input_dlgproc,
+						(LPARAM) &gi)) 
+		return set_exposure_time(hdcam, gi._new_value);			
+
+	return false;
+}
+
+bool setup_camera(HDCAM hdcam)
+{
+	//DCAM_DATATYPE datatype;
+	int32 min, max;
+	//unsigned long before_framebytes, after_framebytes;
+
+	/*
+	if (!dcam_getdataframebytes(hdcam, &before_framebytes)) {
+		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
+		return false;
+	}
+	*/
+
+	/*
+	if (!dcam_getdatatype(hdcam, &datatype)) {
+		print_last_dcamerr(hdcam, "dcam_getdatatype");
+		return false;
+	}
+
+	if (!dcam_setdatatype(hdcam, DCAM_DATATYPE_UINT8)) {
+		print_last_dcamerr(hdcam, "dcam_setdatatype");
+		return false;
+	}
+	
+	if (!dcam_getdatarange(hdcam, &max, &min)) {
+		print_last_dcamerr(hdcam, "dcam_getdatarange");
+		return false;
+	}
+	*/
+
+	if (!dcam_setbinning(hdcam, 2)) {
+		print_last_dcamerr(hdcam, "dcam_setbinning");
+		return false;
+	}
+	/*
+	if (!dcam_getdataframebytes(hdcam, &after_framebytes)) {
+		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
+		return false;
+	}
+	*/
+
+	if (!dcam_getdatarange(hdcam, &max, &min)) {
+		print_last_dcamerr(hdcam, "dcam_getdatarange");
+		return false;
+	}
+
+	if (max > 0) {
+		max++;
+		g_data_shift = 0;
+
+		while (max < 65536) {
+			g_data_shift++;
+			max <<= 1;
+		}
 	}
 
 	return true;
@@ -134,7 +271,10 @@ void print_last_dcamerr(HDCAM hdcam, const char *lastcall)
 
 	long err = dcam_getlasterror(hdcam, msg, sizeof(msg));
 
-	printf("failure: %s returned 0x%08X\n");
+	if (lastcall && *lastcall) 
+		printf("DCAM failure: %s returned 0x%08X\n", lastcall, err);
+	else
+		printf("DCAM error 0x%08X\n", err);
 
 	if (*msg)
 		printf("\t%s\n", msg);
@@ -177,14 +317,18 @@ bool read_one_frame(HDCAM hdcam, IplImage *img)
 
 	dcam_lockdata(hdcam, &top, &bytes_per_row, 0);
 	
-	bytes_per_frame = img->width * img->height * 2;
+	bytes_per_frame = img->width * img->height;
+
+	if (img->depth == IPL_DEPTH_16U)
+		bytes_per_frame *= 2;
 
 	memcpy(img->imageData, top, bytes_per_frame);
 	dcam_unlockdata(hdcam);
 	
 	dcam_idle(hdcam);
 
-	scale_image_to_16_bits(img, 12);
+	if (img->depth == IPL_DEPTH_16U) 
+		scale_image_to_16_bits(img);
 
 	success = true;
 
@@ -199,18 +343,65 @@ read_done:
 /*
   TODO: Figure out num_bits dynamically. Could be 12 or 14.
 */
-void scale_image_to_16_bits(IplImage *img, int actual_bits)
+void scale_image_to_16_bits(IplImage *img)
 {
 	int i, n;
 	unsigned short *p;
-	int shift = 16 - actual_bits;
-
+	
 	n = img->width * img->height;
 
 	p = (unsigned short *)img->imageData;
 
 	for (i = 0; i < n; i++, p++) {
-		*p <<= shift;
+		*p <<= g_data_shift;
 	}
 }
 
+BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	genericInput *gi;
+	char buff[32];
+
+	switch (msg) {
+	case WM_INITDIALOG:
+		gi = (genericInput *)lParam;
+
+		if (!gi)
+			return TRUE;
+
+		SetWindowLong(hDlg, GWL_USERDATA, lParam);
+		
+		SetWindowText(hDlg, gi->_title);
+		SetDlgItemText(hDlg, IDC_PROMPT, gi->_prompt);
+		sprintf_s(buff, sizeof(buff), "%0.4lf", gi->_old_value);
+		SetDlgItemText(hDlg, IDC_VALUE, buff);
+		break;
+
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+		case IDOK:
+			memset(buff, 0, sizeof(buff));
+			if (GetDlgItemText(hDlg, IDC_VALUE, buff, sizeof(buff) - 1)) {
+				gi = (genericInput *) GetWindowLong(hDlg, GWL_USERDATA);			
+				gi->_new_value = atof(buff);
+
+				if (abs(gi->_old_value - gi->_new_value) > 0.0001)
+					EndDialog(hDlg, 1);
+				else 
+					EndDialog(hDlg, 0);
+			}
+			else {
+				MessageBox(hDlg, "Need a value", "Input Error", MB_OK);
+			}
+
+			break;
+
+		case IDCANCEL:
+			EndDialog(hDlg, 0);
+			break;
+		}
+
+	}
+
+	return FALSE;
+}
