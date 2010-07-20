@@ -22,8 +22,8 @@ IplImage *allocate_image(HDCAM hdcam);
 bool set_exposure_time(HDCAM hdcam, double exposure_sec);
 bool get_exposure_time_from_user(HDCAM hdcam);
 bool setup_camera(HDCAM hdcam);
-bool read_one_frame(HDCAM hdcam, IplImage *img, unsigned long *elapsed);
-void scale_image_to_16_bits(IplImage *img);
+bool read_one_frame(HDCAM hdcam, IplImage *img);
+
 void scale_image_to_8_bits(IplImage *img, unsigned short *raw_data);
 
 class genericInput {
@@ -38,7 +38,7 @@ BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
 int g_data_lshift = 0;
 int g_data_rshift = 0;
-double g_exposure_sec = 0.0015;
+double g_exposure_sec = 0.0005;
 unsigned short *g_raw_data;
 
 int main(int argc, char **argv)
@@ -102,8 +102,8 @@ void image_loop(HDCAM hdcam, IplImage *img)
 		return;
 	}
 
-	// 12 ms / frame
-	if (!dcam_allocframe(hdcam, 10)) {
+	// 12 ms
+	if (!dcam_allocframe(hdcam, 20)) {
 		print_last_dcamerr(hdcam, "dcam_allocframe");
 		return;
 	}
@@ -111,24 +111,29 @@ void image_loop(HDCAM hdcam, IplImage *img)
 		frame_allocated = true;
 	}
 
-	// 54 ms / frame
+	// 54 ms
 	if (!dcam_capture(hdcam)) {
 		print_last_dcamerr(hdcam, "dcam_capture");
 		done = true;
 	}
 
 	while (!done) {	
-		if (!read_one_frame(hdcam, img, &elapsed))
+		if (!read_one_frame(hdcam, img))
 			break;
-
-		timing += elapsed;
 
 		frame_count++;
 
-		if ((frame_count & 0x0011) == 0x0011) {
+		if (frame_count & 0x0001) {
+			elapsed = timeGetTime();
+
+			// 2.8 ms / frame
+			scale_image_to_8_bits(img, g_raw_data);
+						
+			timing += timeGetTime() - elapsed;
+
 			cvShowImage("HCImage", img);
 			key = cvWaitKey(1);
-			update_frame_count(frame_count, start, timing);
+			update_frame_count(frame_count, start, timing * 2);
 		
 			switch (key & 0xff) {
 			case 0x1b:	// escape
@@ -143,6 +148,9 @@ void image_loop(HDCAM hdcam, IplImage *img)
 			case 'S':
 			case 's':
 				get_exposure_time_from_user(hdcam);
+				start = GetTickCount();
+				timing = 0;
+				frame_count = 0;
 				break;
 			}
 		}
@@ -152,7 +160,7 @@ void image_loop(HDCAM hdcam, IplImage *img)
 	dcam_getstatus(hdcam, &status);
 
 	if (DCAM_STATUS_BUSY == status) {
-		// 116 ms / frame
+		// 116 ms
 		dcam_idle(hdcam);
 	}
 
@@ -163,53 +171,35 @@ void image_loop(HDCAM hdcam, IplImage *img)
 
 	if (DCAM_STATUS_BUSY == status)
 		dcam_idle(hdcam);
-
 }
 
-bool read_one_frame(HDCAM hdcam, IplImage *img, unsigned long *elapsed)
+bool read_one_frame(HDCAM hdcam, IplImage *img)
 {
 	unsigned long wait_flags;
 	long newestframeindex, framecount, bytes_per_row;
 	unsigned long bytes_per_frame;
 	void *top;
-	bool success = false;
 
-	// 0 ms / frame
 	if (!dcam_getdataframebytes(hdcam, &bytes_per_frame)) {
 		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
-		goto read_done;
+		return false;
 	}
 
 	wait_flags = DCAM_EVENT_FRAMEEND;
-	//wait_flags = DCAM_EVENT_CAPTUREEND;
 		
-	// 27 ms / frame
-	*elapsed = timeGetTime();
 	if (!dcam_wait(hdcam, &wait_flags, DCAM_WAIT_INFINITE, NULL)) {
 		print_last_dcamerr(hdcam, "dcam_wait");
-		goto read_done;
+		return false;
 	}
-	*elapsed = timeGetTime() - *elapsed;
 
-	// 0.02 ms / frame
 	dcam_gettransferinfo(hdcam, &newestframeindex, &framecount);
 
 	// 2 ms / frame
 	dcam_lockdata(hdcam, &top, &bytes_per_row, newestframeindex);
 	memcpy(g_raw_data, top, bytes_per_frame);
 	dcam_unlockdata(hdcam);
-		
-	// 4 ms / frame
-	if (img->depth == IPL_DEPTH_8U) 
-		scale_image_to_8_bits(img, g_raw_data);
-	else if (img->depth == IPL_DEPTH_16U) 
-		scale_image_to_16_bits(img);
-	
-	success = true;
 
-read_done:
-
-	return success;
+	return true;
 }
 
 void update_frame_count(int frame_count, unsigned long start, unsigned long timing)
@@ -304,6 +294,11 @@ IplImage *allocate_image(HDCAM hdcam)
 	unsigned long bytes_per_frame;
 	
 	IplImage *img = NULL;
+
+	if (!dcam_setbinning(hdcam, 2)) {
+		print_last_dcamerr(hdcam, "dcam_setbinning()");
+		return NULL;
+	}
 
 	if (!dcam_getdatasize(hdcam, &size)) {
 		print_last_dcamerr(hdcam, "dcam_getdatasize()");
@@ -416,23 +411,6 @@ void print_last_dcamerr(HDCAM hdcam, const char *lastcall)
 #endif
 }
 
-/*
-  TODO: Figure out num_bits dynamically. Could be 12 or 14.
-*/
-void scale_image_to_16_bits(IplImage *img)
-{
-	int i, n;
-	unsigned short *p;
-	
-	n = img->width * img->height;
-
-	p = (unsigned short *)img->imageData;
-
-	for (i = 0; i < n; i++, p++) {
-		*p <<= g_data_lshift;
-	}
-}
-
 void scale_image_to_8_bits(IplImage *img, unsigned short *raw_data)
 {
 	int n = img->width * img->height;
@@ -457,7 +435,7 @@ BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 		
 		SetWindowText(hDlg, gi->_title);
 		SetDlgItemText(hDlg, IDC_PROMPT, gi->_prompt);
-		sprintf_s(buff, sizeof(buff), "%0.4lf", gi->_old_value);
+		sprintf_s(buff, sizeof(buff), "%0.6lf", gi->_old_value);
 		SetDlgItemText(hDlg, IDC_VALUE, buff);
 		break;
 
@@ -469,7 +447,7 @@ BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 				gi = (genericInput *) GetWindowLong(hDlg, GWL_USERDATA);			
 				gi->_new_value = atof(buff);
 
-				if (abs(gi->_old_value - gi->_new_value) > 0.0001)
+				if (abs(gi->_old_value - gi->_new_value) > 0.000001)
 					EndDialog(hDlg, 1);
 				else 
 					EndDialog(hDlg, 0);
