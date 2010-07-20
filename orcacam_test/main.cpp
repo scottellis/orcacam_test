@@ -14,15 +14,17 @@
 #include "cv.h"
 #include "highgui.h"
 
-
+void image_loop(HDCAM hdcam, IplImage *img);
+void update_frame_count(int frame_count, unsigned long start, unsigned long timing);
 void print_last_dcamerr(HDCAM hdcam, const char *lastcall);
 HDCAM allocate_camera();
 IplImage *allocate_image(HDCAM hdcam);
 bool set_exposure_time(HDCAM hdcam, double exposure_sec);
 bool get_exposure_time_from_user(HDCAM hdcam);
 bool setup_camera(HDCAM hdcam);
-bool read_one_frame(HDCAM hdcam, IplImage *img);
+bool read_one_frame(HDCAM hdcam, IplImage *img, unsigned long *elapsed);
 void scale_image_to_16_bits(IplImage *img);
+void scale_image_to_8_bits(IplImage *img, unsigned short *raw_data);
 
 class genericInput {
 public:
@@ -34,15 +36,17 @@ public:
 
 BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam);
 
-int g_data_shift = 0;
-double g_exposure_sec = 0.0006;
+int g_data_lshift = 0;
+int g_data_rshift = 0;
+double g_exposure_sec = 0.0015;
+unsigned short *g_raw_data;
 
 int main(int argc, char **argv)
 {
-	int key;
-	bool done;
 	HDCAM hdcam = 0;
 	IplImage *img = NULL;
+
+	timeBeginPeriod(1);
 
 	hdcam = allocate_camera();
 
@@ -60,46 +64,197 @@ int main(int argc, char **argv)
 	if (!img)
 		goto done;
 
-	cvNamedWindow("HCImage", 0); //CV_WINDOW_AUTOSIZE);
+	cvNamedWindow("HCImage", 0); 
 
-	done = false;
-
-	while (!done) {
-		if (!read_one_frame(hdcam, img))
-			break;
-
-		cvShowImage("HCImage", img);
-		
-		key = cvWaitKey(10);
-
-		switch (key & 0xff) {
-		case 0x1b:	// escape
-			done = true;
-			break;
-
-		case 'G':
-		case 'g':
-			MessageBox((HWND)cvGetWindowHandle("HCImage"), "todo", "Gain Setting", MB_OK);
-			break;
-
-		case 'S':
-		case 's':
-			get_exposure_time_from_user(hdcam);
-			break;
-		}
-	}
-
+	image_loop(hdcam, img);
 
 done:
+	if (g_raw_data)
+		delete [] g_raw_data;
+
 	if (img)
 		cvReleaseImage(&img);
 
-	if (hdcam)
+	if (hdcam)	
 		dcam_close(hdcam);
 
 	dcam_uninit(NULL, NULL);
 
+	timeEndPeriod(1);
+
 	return 0;
+}
+
+void image_loop(HDCAM hdcam, IplImage *img)
+{
+	int key, frame_count;
+	unsigned long start, timing, elapsed, status;
+	bool frame_allocated = false;
+	bool done = false;
+
+	frame_count = 0;
+	start = GetTickCount();
+	timing = 0;
+
+	// 0 ms / frame
+	if (!dcam_precapture(hdcam, DCAM_CAPTUREMODE_SEQUENCE)) {
+		print_last_dcamerr(hdcam, "dcam_precapture");
+		return;
+	}
+
+	// 12 ms / frame
+	if (!dcam_allocframe(hdcam, 10)) {
+		print_last_dcamerr(hdcam, "dcam_allocframe");
+		return;
+	}
+	else {
+		frame_allocated = true;
+	}
+
+	// 54 ms / frame
+	if (!dcam_capture(hdcam)) {
+		print_last_dcamerr(hdcam, "dcam_capture");
+		done = true;
+	}
+
+	while (!done) {	
+		if (!read_one_frame(hdcam, img, &elapsed))
+			break;
+
+		timing += elapsed;
+
+		frame_count++;
+
+		if ((frame_count & 0x0011) == 0x0011) {
+			cvShowImage("HCImage", img);
+			key = cvWaitKey(1);
+			update_frame_count(frame_count, start, timing);
+		
+			switch (key & 0xff) {
+			case 0x1b:	// escape
+				done = true;
+				break;
+
+			case 'G':
+			case 'g':
+				MessageBox((HWND)cvGetWindowHandle("HCImage"), "todo", "Gain Setting", MB_OK);
+				break;
+
+			case 'S':
+			case 's':
+				get_exposure_time_from_user(hdcam);
+				break;
+			}
+		}
+	}
+		
+	// 1 == DCAM_STATUS_BUSY
+	dcam_getstatus(hdcam, &status);
+
+	if (DCAM_STATUS_BUSY == status) {
+		// 116 ms / frame
+		dcam_idle(hdcam);
+	}
+
+	if (frame_allocated)
+		dcam_freeframe(hdcam);
+
+	dcam_getstatus(hdcam, &status);
+
+	if (DCAM_STATUS_BUSY == status)
+		dcam_idle(hdcam);
+
+}
+
+bool read_one_frame(HDCAM hdcam, IplImage *img, unsigned long *elapsed)
+{
+	unsigned long wait_flags;
+	long newestframeindex, framecount, bytes_per_row;
+	unsigned long bytes_per_frame;
+	void *top;
+	bool success = false;
+
+	// 0 ms / frame
+	if (!dcam_getdataframebytes(hdcam, &bytes_per_frame)) {
+		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
+		goto read_done;
+	}
+
+	wait_flags = DCAM_EVENT_FRAMEEND;
+	//wait_flags = DCAM_EVENT_CAPTUREEND;
+		
+	// 27 ms / frame
+	*elapsed = timeGetTime();
+	if (!dcam_wait(hdcam, &wait_flags, DCAM_WAIT_INFINITE, NULL)) {
+		print_last_dcamerr(hdcam, "dcam_wait");
+		goto read_done;
+	}
+	*elapsed = timeGetTime() - *elapsed;
+
+	// 0.02 ms / frame
+	dcam_gettransferinfo(hdcam, &newestframeindex, &framecount);
+
+	// 2 ms / frame
+	dcam_lockdata(hdcam, &top, &bytes_per_row, newestframeindex);
+	memcpy(g_raw_data, top, bytes_per_frame);
+	dcam_unlockdata(hdcam);
+		
+	// 4 ms / frame
+	if (img->depth == IPL_DEPTH_8U) 
+		scale_image_to_8_bits(img, g_raw_data);
+	else if (img->depth == IPL_DEPTH_16U) 
+		scale_image_to_16_bits(img);
+	
+	success = true;
+
+read_done:
+
+	return success;
+}
+
+void update_frame_count(int frame_count, unsigned long start, unsigned long timing)
+{
+	HDC hdc;
+	RECT r;
+	int len, oldbkmode;
+	COLORREF oldcolor; 
+	SIZE sz;
+	unsigned long elapsed;
+	char buff[32];
+
+	HWND hWnd = (HWND) cvGetWindowHandle("HCImage");
+
+	if (!hWnd)
+		return;
+
+	hdc = GetDC(hWnd);
+
+	elapsed = GetTickCount() - start;
+
+	len = sprintf_s(buff, sizeof(buff), "Frame %d", frame_count);
+	GetClientRect(hWnd, &r);
+	GetTextExtentPoint32(hdc, buff, len, &sz);
+
+	oldcolor = SetTextColor(hdc, RGB(60, 180, 0));
+	oldbkmode = SetBkMode(hdc, TRANSPARENT);
+	
+	TextOut(hdc, r.left + 10, r.bottom - (3 * (sz.cy + 10)), buff, len);
+
+	if (elapsed > 0) {
+		len = sprintf_s(buff, sizeof(buff), "Rate %0.2lf fps", 
+						(1000.0 * (double)frame_count) / (double)elapsed);
+		TextOut(hdc, r.left + 10, r.bottom - (2 * (sz.cy + 10)), buff, len);
+	}
+
+	len = sprintf_s(buff, sizeof(buff), "Timing %0.2lf ms / frame", 
+					(double)timing / (double)frame_count);
+	TextOut(hdc, r.left + 10, r.bottom - (sz.cy + 10), buff, len);
+	
+
+	SetBkMode(hdc, oldbkmode);
+	SetTextColor(hdc, oldcolor);
+
+	ReleaseDC(hWnd, hdc);
 }
 
 HDCAM allocate_camera()
@@ -111,14 +266,22 @@ HDCAM allocate_camera()
 	ticks = GetTickCount();
 
 	if (!dcam_init(NULL, &num_devices, NULL)) {
+#if defined (CONSOLE_ONLY)
 		printf("dcam_init() failed\n");
+#else
+		MessageBox(NULL, "dcam_init() failed", "dcam_init", MB_OK);
+#endif
 		return 0;
 	}
 
 	printf("dcam_init() took %lu ms\n", GetTickCount() - ticks);
 
 	if (num_devices < 1) {
+#if defined (CONSOLE_ONLY)
 		printf("dcam_init(): num_devices = %lu\n", num_devices);
+#else
+		MessageBox(NULL, "No cameras detected", "dcam_init", MB_OK);
+#endif
 		return 0;
 	}
 
@@ -138,7 +301,7 @@ IplImage *allocate_image(HDCAM hdcam)
 {
 	SIZE size;
 	CvSize sz;
-	unsigned long bytes_per_frame, pixel_depth;
+	unsigned long bytes_per_frame;
 	
 	IplImage *img = NULL;
 
@@ -152,24 +315,19 @@ IplImage *allocate_image(HDCAM hdcam)
 
 	if (!dcam_getdataframebytes(hdcam, &bytes_per_frame)) {
 		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
-		return false;
+		return NULL;
 	}
 
 	sz.width = size.cx;
 	sz.height = size.cy;
 
-	pixel_depth = bytes_per_frame / (sz.width * sz.height);
+	g_raw_data = new unsigned short[sz.width * sz.height];
 
-	if (pixel_depth == 2) {
-		img = cvCreateImage(sz, IPL_DEPTH_16U, 1);
-	}
-	else if (pixel_depth == 1) {
-		img = cvCreateImage(sz, IPL_DEPTH_8U, 1);
-	}
-	else {
-		printf("Unhandled pixel_depth %ld\n", pixel_depth);
-	}
-	
+	if (!g_raw_data)
+		return NULL;
+
+	img = cvCreateImage(sz, IPL_DEPTH_8U, 1);
+
 	return img;
 }
 
@@ -206,44 +364,7 @@ bool get_exposure_time_from_user(HDCAM hdcam)
 
 bool setup_camera(HDCAM hdcam)
 {
-	//DCAM_DATATYPE datatype;
 	int32 min, max;
-	//unsigned long before_framebytes, after_framebytes;
-
-	/*
-	if (!dcam_getdataframebytes(hdcam, &before_framebytes)) {
-		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
-		return false;
-	}
-	*/
-
-	/*
-	if (!dcam_getdatatype(hdcam, &datatype)) {
-		print_last_dcamerr(hdcam, "dcam_getdatatype");
-		return false;
-	}
-
-	if (!dcam_setdatatype(hdcam, DCAM_DATATYPE_UINT8)) {
-		print_last_dcamerr(hdcam, "dcam_setdatatype");
-		return false;
-	}
-	
-	if (!dcam_getdatarange(hdcam, &max, &min)) {
-		print_last_dcamerr(hdcam, "dcam_getdatarange");
-		return false;
-	}
-	*/
-
-	if (!dcam_setbinning(hdcam, 2)) {
-		print_last_dcamerr(hdcam, "dcam_setbinning");
-		return false;
-	}
-	/*
-	if (!dcam_getdataframebytes(hdcam, &after_framebytes)) {
-		print_last_dcamerr(hdcam, "dcam_getdataframebytes");
-		return false;
-	}
-	*/
 
 	if (!dcam_getdatarange(hdcam, &max, &min)) {
 		print_last_dcamerr(hdcam, "dcam_getdatarange");
@@ -251,12 +372,11 @@ bool setup_camera(HDCAM hdcam)
 	}
 
 	if (max > 0) {
-		max++;
-		g_data_shift = 0;
+		g_data_rshift = 0;
 
-		while (max < 65536) {
-			g_data_shift++;
-			max <<= 1;
+		while (max > 255) {
+			g_data_rshift++;
+			max >>= 1;
 		}
 	}
 
@@ -271,6 +391,7 @@ void print_last_dcamerr(HDCAM hdcam, const char *lastcall)
 
 	long err = dcam_getlasterror(hdcam, msg, sizeof(msg));
 
+#if defined (CONSOLE_ONLY)
 	if (lastcall && *lastcall) 
 		printf("DCAM failure: %s returned 0x%08X\n", lastcall, err);
 	else
@@ -278,66 +399,21 @@ void print_last_dcamerr(HDCAM hdcam, const char *lastcall)
 
 	if (*msg)
 		printf("\t%s\n", msg);
-}
+#else
+	char buff[512];
 
-bool read_one_frame(HDCAM hdcam, IplImage *img)
-{
-	unsigned long wait_flags;
-	long index, total, bytes_per_row, bytes_per_frame;
-	void *top;
-	bool success = false;
-	bool frame_allocated = false;
+	if (lastcall && *lastcall) 
+		sprintf_s(buff, sizeof(buff), "%s : Error code 0x%08X", lastcall, err);
+	else
+		sprintf_s(buff, sizeof(buff), "Error code 0x%08X", err);
 
-	if (!dcam_precapture(hdcam, DCAM_CAPTUREMODE_SNAP)) {
-		print_last_dcamerr(hdcam, "dcam_precapture");
-		goto read_done;
+	if (*msg) {
+		strncat_s(buff, sizeof(buff), "\n\n", _TRUNCATE);
+		strncat_s(buff, sizeof(buff), msg, _TRUNCATE);
 	}
 
-	if (!dcam_allocframe(hdcam, 1)) {
-		print_last_dcamerr(hdcam, "dcam_allocframe");
-		goto read_done;
-	}
-	else {
-		frame_allocated = true;
-	}
-
-	if (!dcam_capture(hdcam)) {
-		print_last_dcamerr(hdcam, "dcam_capture");
-		goto read_done;
-	}
-
-	wait_flags = DCAM_EVENT_FRAMEEND;
-
-	if (!dcam_wait(hdcam, &wait_flags, DCAM_WAIT_INFINITE, NULL)) {
-		print_last_dcamerr(hdcam, "dcam_wait");
-		goto read_done;
-	}
-
-	dcam_gettransferinfo(hdcam, &index, &total);
-
-	dcam_lockdata(hdcam, &top, &bytes_per_row, 0);
-	
-	bytes_per_frame = img->width * img->height;
-
-	if (img->depth == IPL_DEPTH_16U)
-		bytes_per_frame *= 2;
-
-	memcpy(img->imageData, top, bytes_per_frame);
-	dcam_unlockdata(hdcam);
-	
-	dcam_idle(hdcam);
-
-	if (img->depth == IPL_DEPTH_16U) 
-		scale_image_to_16_bits(img);
-
-	success = true;
-
-read_done:
-
-	if (frame_allocated)
-		dcam_freeframe(hdcam);
-
-	return success;
+	MessageBox(NULL, buff, "DCAM Error", MB_OK);
+#endif
 }
 
 /*
@@ -353,8 +429,16 @@ void scale_image_to_16_bits(IplImage *img)
 	p = (unsigned short *)img->imageData;
 
 	for (i = 0; i < n; i++, p++) {
-		*p <<= g_data_shift;
+		*p <<= g_data_lshift;
 	}
+}
+
+void scale_image_to_8_bits(IplImage *img, unsigned short *raw_data)
+{
+	int n = img->width * img->height;
+		
+	for (int i = 0; i < n; i++)
+		img->imageData[i] = (unsigned char) (raw_data[i] >> g_data_rshift);
 }
 
 BOOL CALLBACK generic_input_dlgproc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
